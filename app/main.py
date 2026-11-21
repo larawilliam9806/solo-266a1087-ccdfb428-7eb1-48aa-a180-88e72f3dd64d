@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import db
+from . import diff as diff_mod
 from .gtfs import WEEKDAY_COLUMNS, format_gtfs_time, validate_version
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -123,6 +124,31 @@ def _require_current(conn) -> int:
     return vid
 
 
+def _require_published(conn, version_id: int, role: str) -> None:
+    """确认版本存在且为已发布状态；否则整体拒绝，不生成任何部分结果。"""
+    row = conn.execute(
+        "SELECT status FROM versions WHERE id = ?", (version_id,)).fetchone()
+    if row is None:
+        raise HTTPException(404, f"{role}版本 {version_id} 不存在")
+    if row["status"] != "published":
+        raise HTTPException(422, f"{role}版本 {version_id} 不是已发布版本（状态：{row['status']}），无法用于差异分析")
+
+
+@app.get("/api/versions/{version_id}/routes")
+def version_routes(version_id: int):
+    """指定已发布版本的线路列表（供差异分析选择线路，不局限于当前正式版）。"""
+    conn = db.connect()
+    try:
+        _require_published(conn, version_id, "指定")
+        rows = conn.execute(
+            "SELECT route_id, route_short_name, route_long_name, route_type "
+            "FROM routes WHERE version_id = ? ORDER BY route_id",
+            (version_id,)).fetchall()
+    finally:
+        conn.close()
+    return {"version_id": version_id, "routes": [dict(r) for r in rows]}
+
+
 @app.get("/api/routes")
 def list_routes():
     conn = db.connect()
@@ -224,6 +250,51 @@ def _stop_time_dict(row) -> dict:
         "arrival_clock": format_gtfs_time(arr % 86400),
         "departure_clock": format_gtfs_time(dep % 86400),
     }
+
+
+# ---------------- 运行图差异分析（固定两版完整快照） ----------------
+
+@app.get("/api/diff")
+def schedule_diff(
+    old_version_id: int = Query(..., description="旧版本 ID"),
+    new_version_id: int = Query(..., description="新版本 ID"),
+    route_id: str = Query(..., description="线路 ID"),
+    date: str = Query(..., description="运营日，格式 YYYY-MM-DD"),
+):
+    """比较两个已发布版本在同一线路、同一运营日上的运行图差异。
+
+    先完成全部参数与版本校验（任一不合法直接 4xx，不生成部分结果），
+    再分别加载两版的完整快照后整体比较；版本数据不可变，请求内固定两个
+    version_id，结果始终来自两份完整快照。
+    """
+    try:
+        svc_date = date_type.fromisoformat(date)
+    except ValueError:
+        raise HTTPException(422, f"date '{date}' 不是合法的 YYYY-MM-DD 日期")
+    if old_version_id == new_version_id:
+        raise HTTPException(422, "差异分析需要选择两个不同的已发布版本")
+    weekday_col = WEEKDAY_COLUMNS[svc_date.weekday()]
+
+    conn = db.connect()
+    try:
+        # 先校验两版，全部通过后才加载数据，杜绝部分结果
+        _require_published(conn, old_version_id, "旧")
+        _require_published(conn, new_version_id, "新")
+
+        old_snap = diff_mod.load_snapshot(conn, old_version_id, route_id,
+                                          date, weekday_col)
+        new_snap = diff_mod.load_snapshot(conn, new_version_id, route_id,
+                                          date, weekday_col)
+    finally:
+        conn.close()
+
+    if old_snap.route is None and new_snap.route is None:
+        raise HTTPException(404,
+                            f"线路 '{route_id}' 在版本 {old_version_id} 和 "
+                            f"{new_version_id} 中均不存在")
+
+    return diff_mod.diff_snapshots(old_snap, new_snap, route_id,
+                                   date, weekday_col)
 
 
 # ---------------- 网页 ----------------

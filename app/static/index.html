@@ -43,12 +43,27 @@
   .nextday { color: var(--red); font-size: 12px; }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 0 24px; }
   code { background: #f1f3f4; padding: 1px 5px; border-radius: 3px; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; font-weight: 600; }
+  .badge.add { background: #e6f4ea; color: var(--green); }
+  .badge.rm { background: #fce8e6; color: var(--red); }
+  .badge.adj { background: #fef7e0; color: #b06000; }
+  .badge.same { background: #e8f0fe; color: var(--blue); }
+  .badge.conflict { background: #fce8e6; color: var(--red); }
+  .delta-pos { color: var(--red); font-weight: 600; }
+  .delta-neg { color: var(--blue); font-weight: 600; }
+  .delta-zero { color: #5f6368; }
+  .diff-group { margin-top: 16px; }
+  .diff-group h3 { font-size: 14px; margin: 0 0 8px; }
+  .summary-pills span { display: inline-block; margin-right: 10px; font-size: 13px; padding: 3px 10px;
+                        border: 1px solid var(--border); border-radius: 12px; background: #f8f9fa; }
+  .tripmini { font-size: 12px; color: #5f6368; }
 </style>
 </head>
 <body>
 <header><h1>🚌 公交 GTFS 时刻表发布系统</h1></header>
 <nav>
   <button data-tab="query" class="active">时刻查询</button>
+  <button data-tab="diff">运行图差异分析</button>
   <button data-tab="publish">发布新版本</button>
   <button data-tab="versions">版本记录</button>
 </nav>
@@ -71,6 +86,36 @@
     <button class="primary" id="q-btn">查询</button>
     <span class="muted" id="q-meta"></span>
     <div id="q-result"></div>
+  </div>
+</section>
+
+<!-- ============ 运行图差异分析 ============ -->
+<section id="tab-diff" class="panel">
+  <div class="card">
+    <h2>两个已发布版本的运行图差异</h2>
+    <p class="muted">选择两个不同的已发布版本、线路与同一运营日。系统分别固定两版完整快照后整体比较：
+       班次号变化时按线路、运营日与有序停站序列匹配；候选不唯一会报冲突并列出对应班次，不擅自合并。
+       版本或日期无效时直接报错，不会生成部分结果。</p>
+    <div class="grid">
+      <div>
+        <label>旧版本（基准）</label>
+        <select id="d-old"></select>
+      </div>
+      <div>
+        <label>新版本（对比）</label>
+        <select id="d-new"></select>
+      </div>
+      <div>
+        <label>运营日</label>
+        <input type="date" id="d-date">
+      </div>
+      <div>
+        <label>线路</label>
+        <select id="d-route"></select>
+      </div>
+    </div>
+    <button class="primary" id="d-btn">分析差异</button>
+    <div id="d-result"></div>
   </div>
 </section>
 
@@ -115,6 +160,7 @@ document.querySelectorAll("nav button").forEach(btn => {
     $("tab-" + btn.dataset.tab).classList.add("active");
     if (btn.dataset.tab === "versions") loadVersions();
     if (btn.dataset.tab === "query") loadRoutes();
+    if (btn.dataset.tab === "diff") initDiffTab();
   };
 });
 
@@ -221,6 +267,168 @@ async function showErrors(vid) {
     ${data.errors.map(e => `<tr><td>${e.file}</td><td>${e.row ?? "-"}</td>
       <td>${e.field ?? "-"}</td><td>${e.message}</td></tr>`).join("")}</table>`;
 }
+
+// ---------- 运行图差异分析 ----------
+$("d-date").value = new Date().toISOString().slice(0, 10);
+let diffVersions = [];
+
+async function initDiffTab() {
+  if (!diffVersions.length) {
+    const res = await fetch("/api/versions");
+    const data = await res.json();
+    diffVersions = (data.versions || []).filter(v => v.status === "published");
+    const opts = diffVersions.length
+      ? diffVersions.map(v => `<option value="${v.id}">v${v.id} ${v.label}</option>`).join("")
+      : '<option value="">（暂无已发布版本）</option>';
+    $("d-old").innerHTML = opts;
+    $("d-new").innerHTML = opts;
+    if (diffVersions.length >= 2) {
+      // 列表按 id 倒序：默认旧版选次新、新版选最新
+      $("d-new").selectedIndex = 0;
+      $("d-old").selectedIndex = 1;
+    }
+  }
+  loadDiffRoutes();
+}
+
+async function loadDiffRoutes() {
+  const oldId = $("d-old").value, newId = $("d-new").value;
+  const sel = $("d-route");
+  if (!oldId || !newId) { sel.innerHTML = "<option value=''>（请先选择两个版本）</option>"; return; }
+  const [r1, r2] = await Promise.all([
+    fetch(`/api/versions/${oldId}/routes`).then(r => r.ok ? r.json() : {routes: []}),
+    fetch(`/api/versions/${newId}/routes`).then(r => r.ok ? r.json() : {routes: []}),
+  ]);
+  const merged = new Map();
+  for (const r of [...r1.routes, ...r2.routes]) {
+    if (!merged.has(r.route_id)) merged.set(r.route_id, r);
+  }
+  sel.innerHTML = [...merged.values()].map(r =>
+    `<option value="${r.route_id}">${r.route_short_name || r.route_id} ${r.route_long_name || ""}</option>`).join("")
+    || "<option value=''>（两版均无线路）</option>";
+}
+$("d-old").onchange = loadDiffRoutes;
+$("d-new").onchange = loadDiffRoutes;
+
+function fmtDelta(secs, minutes) {
+  if (secs === null || minutes === null) return '<span class="muted">不适用（停站变化）</span>';
+  if (secs === 0) return '<span class="delta-zero">0 分钟（不变）</span>';
+  const cls = secs > 0 ? "delta-pos" : "delta-neg";
+  const sign = secs > 0 ? "+" : "";
+  return `<span class="${cls}">${sign}${minutes} 分钟（${sign}${secs} 秒）</span>`;
+}
+
+function stopCell(s) {
+  if (!s) return '<span class="muted">（该侧无此停站）</span>';
+  const off = (s.arrival_day_offset > 0 || s.departure_day_offset > 0)
+    ? ` <span class="nextday">+${Math.max(s.arrival_day_offset, s.departure_day_offset)}天</span>` : "";
+  return `${s.stop_name} <span class="muted">${s.stop_id}</span> · 到 ${s.arrival} / 发 ${s.departure}${off}`;
+}
+
+function tripList(trips) {
+  if (!trips.length) return '<p class="muted">无</p>';
+  return '<table><tr><th>班次</th><th>方向/服务</th><th>停站序列</th><th>首站发车</th></tr>' +
+    trips.map(t => `<tr>
+      <td>${t.trip_id}${t.headsign ? " · " + t.headsign : ""}</td>
+      <td class="tripmini">direction=${t.direction_id ?? "-"} / ${t.service_id}</td>
+      <td class="tripmini">${t.stop_times.map(s => s.stop_id).join(" → ")}</td>
+      <td class="tripmini">${t.stop_times[0]?.departure ?? "-"}</td>
+    </tr>`).join("") + "</table>";
+}
+
+function renderTripGroup(badge, badgeText, trips, withTimes) {
+  if (!trips.length) return "";
+  return `<div class="diff-group"><h3><span class="badge ${badge}">${badgeText}</span> ${trips.length} 个班次</h3>` +
+    (withTimes ? trips.map(t => `
+      <div class="trip">
+        <h4 style="margin:8px 0 4px;font-size:13px">班次 ${t.trip_id}${t.headsign ? " · " + t.headsign : ""}
+          <span class="muted">service: ${t.service_id}</span></h4>
+        <table><tr><th>序号</th><th>站点</th><th>到站</th><th>发车</th></tr>
+        ${t.stop_times.map(s => `<tr><td>${s.stop_sequence}</td>
+          <td>${s.stop_name} <span class="muted">${s.stop_id}</span></td>
+          <td>${s.arrival}${s.arrival_day_offset > 0 ? ` <span class="nextday">+${s.arrival_day_offset}天</span>` : ""}</td>
+          <td>${s.departure}${s.departure_day_offset > 0 ? ` <span class="nextday">+${s.departure_day_offset}天</span>` : ""}</td>
+        </tr>`).join("")}</table>
+      </div>`).join("")
+      : tripList(trips)) + "</div>";
+}
+
+$("d-btn").onclick = async () => {
+  const oldId = $("d-old").value, newId = $("d-new").value,
+        route = $("d-route").value, date = $("d-date").value;
+  const box = $("d-result");
+  if (!oldId || !newId) { box.innerHTML = '<div class="banner err">请选择两个已发布版本</div>'; return; }
+  if (oldId === newId) { box.innerHTML = '<div class="banner err">请选择两个不同的版本</div>'; return; }
+  if (!route || !date) { box.innerHTML = '<div class="banner err">请选择线路和运营日</div>'; return; }
+
+  const url = `/api/diff?old_version_id=${oldId}&new_version_id=${newId}`
+    + `&route_id=${encodeURIComponent(route)}&date=${date}`;
+  const res = await fetch(url);
+  const data = await res.json();
+  if (!res.ok) { box.innerHTML = `<div class="banner err">${typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail)}</div>`; return; }
+
+  const s = data.summary;
+  let html = `<p class="muted">旧版 v${data.old_version.id}「${data.old_version.label}」
+    ${data.old_version.route_present ? "" : '<span class="bad">（该版无此线路）</span>'}
+    → 新版 v${data.new_version.id}「${data.new_version.label}」
+    ${data.new_version.route_present ? "" : '<span class="bad">（该版无此线路）</span>'}
+    · 线路 ${data.route_id} · ${data.date}（${data.weekday}）</p>
+    <div class="summary-pills">
+      <span>旧版班次 ${s.old_trip_count}</span><span>新版班次 ${s.new_trip_count}</span>
+      <span class="badge add">新增 ${s.added}</span><span class="badge rm">移除 ${s.removed}</span>
+      <span class="badge adj">调整 ${s.adjusted}</span><span class="badge same">未变 ${s.unchanged}</span>
+      <span class="badge conflict">冲突 ${s.conflicts}</span>
+    </div>`;
+
+  html += renderTripGroup("add", "新增", data.added, true);
+  html += renderTripGroup("rm", "移除", data.removed, true);
+
+  if (data.adjusted.length) {
+    html += `<div class="diff-group"><h3><span class="badge adj">调整</span> ${data.adjusted.length} 个班次（含首个变化停站）</h3>` +
+      data.adjusted.map(a => {
+        const fc = a.first_change;
+        return `<div class="trip">
+          <h4 style="margin:8px 0 4px;font-size:13px">
+            班次 ${a.old_trip.trip_id} → ${a.new_trip.trip_id}
+            <span class="muted">匹配方式：${a.matched_by === "trip_id" ? "班次号" : "有序停站序列"}</span>
+            ${a.old_trip.trip_id !== a.new_trip.trip_id ? '<span class="badge conflict">班次号已变化</span>' : ""}
+          </h4>
+          <table>
+            <tr><th></th><th>首个变化停站（第 ${fc.index + 1} 个，${fc.change_type === "stop" ? "停站变化" : "时刻变化"}）</th></tr>
+            <tr><td>旧</td><td>${stopCell(fc.old_stop)}</td></tr>
+            <tr><td>新</td><td>${stopCell(fc.new_stop)}</td></tr>
+            <tr><td>到站变化</td><td>${fmtDelta(fc.arrival_delta_secs, fc.arrival_delta_minutes)}</td></tr>
+            <tr><td>发车变化</td><td>${fmtDelta(fc.departure_delta_secs, fc.departure_delta_minutes)}</td></tr>
+          </table>
+          <details><summary class="muted">查看两版完整停站时刻</summary>
+            <table><tr><th>版本</th><th>序号</th><th>站点</th><th>到站</th><th>发车</th></tr>
+            ${a.old_trip.stop_times.map(x => `<tr><td>旧</td><td>${x.stop_sequence}</td><td>${x.stop_name} <span class="muted">${x.stop_id}</span></td><td>${x.arrival}</td><td>${x.departure}</td></tr>`).join("")}
+            ${a.new_trip.stop_times.map(x => `<tr><td>新</td><td>${x.stop_sequence}</td><td>${x.stop_name} <span class="muted">${x.stop_id}</span></td><td>${x.arrival}</td><td>${x.departure}</td></tr>`).join("")}
+            </table>
+          </details>
+        </div>`;
+      }).join("") + "</div>";
+  }
+
+  if (data.unchanged.length) {
+    html += `<div class="diff-group"><h3><span class="badge same">未变化</span> ${data.unchanged.length} 个班次</h3>
+      <p class="muted">${data.unchanged.map(u => u.old_trip_id === u.new_trip_id
+        ? u.old_trip_id : `${u.old_trip_id} → ${u.new_trip_id}`).join("、")}</p></div>`;
+  }
+
+  if (data.conflicts.length) {
+    html += `<div class="diff-group"><h3><span class="badge conflict">匹配冲突</span> ${data.conflicts.length} 组（候选不唯一，未擅自合并）</h3>` +
+      data.conflicts.map(c => `
+        <div class="trip">
+          <h4 style="margin:8px 0 4px;font-size:13px">停站序列：${c.signature.join(" → ")}</h4>
+          <p class="muted">旧版候选 ${c.old_trips.length} 个 / 新版候选 ${c.new_trips.length} 个，下列班次均未计入新增、移除或调整：</p>
+          <p class="muted">旧版：</p>${tripList(c.old_trips)}
+          <p class="muted">新版：</p>${tripList(c.new_trips)}
+        </div>`).join("") + "</div>";
+  }
+
+  box.innerHTML = html;
+};
 
 loadRoutes();
 </script>
